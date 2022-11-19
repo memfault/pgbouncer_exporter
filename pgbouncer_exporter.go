@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
@@ -44,6 +45,27 @@ const (
 	</html>`
 )
 
+func BasicAuth(handler http.HandlerFunc) http.HandlerFunc {
+	return func(rw http.ResponseWriter, rq *http.Request) {
+		u, p, ok := rq.BasicAuth()
+		if !ok || len(strings.TrimSpace(u)) < 1 || len(strings.TrimSpace(p)) < 1 {
+			http.Error(rw, "Unauthorized.", http.StatusUnauthorized)
+			return
+		}
+
+		// This is a dummy check for credentials.
+		if u != os.Getenv("BASIC_AUTH_USER") || p != os.Getenv("BASIC_AUTH_PASS") {
+			http.Error(rw, "Unauthorized.", http.StatusUnauthorized)
+			return
+		}
+
+		// If required, Context could be updated to include authentication
+		// related data so that it could be used in consequent steps.
+		handler(rw, rq)
+	}
+}
+
+
 func main() {
 	const pidFileHelpText = `Path to PgBouncer pid file.
 
@@ -58,8 +80,8 @@ func main() {
 	flag.AddFlags(kingpin.CommandLine, promlogConfig)
 
 	var (
-		connectionStringPointer = kingpin.Flag("pgBouncer.connectionString", "Connection string for accessing pgBouncer.").Default("postgres://postgres:@localhost:6543/pgbouncer?sslmode=disable").String()
-		listenAddress           = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface.").Default(":9127").String()
+		connectionStringPointer = kingpin.Flag("pgBouncer.connectionString", "Connection string for accessing pgBouncer.").Default("postgres://postgres:@localhost:6543/pgbouncer?sslmode=disable").Envar("PGBOUNCER_URL").String()
+		listenPort     = kingpin.Flag("web.listen-port", "Port to listen on for web interface and telemetry.").Default("9584").Envar("PORT").String()
 		metricsPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
 		pidFilePath             = kingpin.Flag("pgBouncer.pid-file", pidFileHelpText).Default("").String()
 	)
@@ -70,10 +92,14 @@ func main() {
 
 	logger := promlog.New(promlogConfig)
 
+	reg := prometheus.NewRegistry()
+
 	connectionString := *connectionStringPointer
 	exporter := NewExporter(connectionString, namespace, logger)
-	prometheus.MustRegister(exporter)
-	prometheus.MustRegister(version.NewCollector("pgbouncer_exporter"))
+
+	reg.MustRegister(exporter)
+	reg.MustRegister(version.NewCollector("pgbouncer_exporter"))
+	handler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 
 	level.Info(logger).Log("msg", "Starting pgbouncer_exporter", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", "build_context", version.BuildContext())
@@ -88,13 +114,19 @@ func main() {
 		prometheus.MustRegister(procExporter)
 	}
 
-	http.Handle(*metricsPath, promhttp.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(*metricsPath, BasicAuth(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r)
+	}))
+	http.HandleFunc("/", BasicAuth(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(fmt.Sprintf(indexHTML, *metricsPath)))
-	})
+	}))
 
-	level.Info(logger).Log("msg", "Listening on", "address", *listenAddress)
-	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
+
+	var listenAddress string
+	listenAddress = ":" + *listenPort
+
+	level.Info(logger).Log("msg", "Listening on", "address", listenAddress)
+	if err := http.ListenAndServe(listenAddress, nil); err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
 	}
